@@ -79,14 +79,14 @@ async def _fetch_anthropic_key() -> str:
     return (await _fetch_secrets(["ANTHROPIC_API_KEY"])).get("ANTHROPIC_API_KEY", "")
 
 
-async def _fetch_github_token() -> str:
-    """Mint a `repo`-scoped GitHub token via the oauth-v2 app. "" if unavailable.
+async def _fetch_oauth_token(provider: str, scopes: list[str]) -> str:
+    """Mint a token via the oauth-v2 app for the named provider. "" if unavailable.
 
     Mirrors openhost's own clone flow (core/oauth.py `get_oauth_token`): the
     token lets us clone private repos openhost has access to. Best-effort — if
-    the oauth app isn't installed, the grant is missing, or no GitHub account is
-    connected, we get a non-200 and return "" so the caller falls back to an
-    unauthenticated clone.
+    the oauth app isn't installed, the grant is missing, or no matching account
+    is connected, we get a non-200 and return "" so the caller falls back to an
+    unauthenticated clone (which will then surface as 403/404 per the contract).
     """
     if not ROUTER_URL or not APP_TOKEN:
         return ""
@@ -95,7 +95,7 @@ async def _fetch_github_token() -> str:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.post(
                 url,
-                json={"provider": "github", "scopes": ["repo"]},
+                json={"provider": provider, "scopes": scopes},
                 headers={"Authorization": f"Bearer {APP_TOKEN}"},
             )
         if resp.status_code != 200:
@@ -295,12 +295,97 @@ def _validate_repo_url(url: str) -> bool:
     return True
 
 
-def _is_github(url: str) -> bool:
-    host = _git_host(url)
-    return host == "github.com" or host.endswith(".github.com")
+# ── token provider lookup ────────────────────────────────────────────────────
+#
+# Each git host can be configured with a token provider so private clones "just
+# work". GitHub is built in (mint via oauth-v2); other hosts — typically a
+# private Forgejo — are declared via env. Format of WORKSPACE_GIT_HOSTS:
+#
+#     host=spec[,host=spec…]
+#
+# where spec is one of:
+#     oauth:<provider>   mint a token via the openhost oauth-v2 app
+#     secret:<key>       read a PAT from the secrets-v2 app at <key>
+#
+# Env entries override/extend the built-ins. Lookup is case-insensitive on host.
+
+_BUILTIN_GIT_HOSTS: dict[str, str] = {"github.com": "oauth:github"}
 
 
-def _inject_github_token(url: str, token: str) -> str:
+@dataclass(frozen=True)
+class TokenProvider:
+    """How to obtain a token for a particular host."""
+
+    kind: str  # "oauth" | "secret"
+    name: str  # oauth provider id, or secrets-v2 key
+
+    @classmethod
+    def parse(cls, spec: str) -> "TokenProvider | None":
+        if ":" not in spec:
+            return None
+        kind, _, name = spec.partition(":")
+        kind, name = kind.strip(), name.strip()
+        if kind not in ("oauth", "secret") or not name:
+            return None
+        return cls(kind=kind, name=name)
+
+
+def _parse_git_hosts_env() -> dict[str, str]:
+    """Parse WORKSPACE_GIT_HOSTS into a {host: spec} map.
+
+    Tolerant: empty/malformed entries are silently skipped so a stray comma or
+    typo in env doesn't take the whole route offline. An invalid spec is caught
+    later at `TokenProvider.parse` time and treated as "host has no configured
+    provider".
+    """
+    raw = os.environ.get("WORKSPACE_GIT_HOSTS", "").strip()
+    if not raw:
+        return {}
+    out: dict[str, str] = {}
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry or "=" not in entry:
+            continue
+        host, _, spec = entry.partition("=")
+        host = host.strip().lower()
+        spec = spec.strip()
+        if host and spec:
+            out[host] = spec
+    return out
+
+
+def _token_provider_for_host(host: str) -> TokenProvider | None:
+    """Look up the token provider for a host, or None if unconfigured.
+
+    Env overrides built-ins so an operator can pin github.com to a PAT in a
+    deployment where oauth-v2 isn't installed. `*.github.com` is folded into
+    `github.com` only when there's no explicit env entry for it.
+    """
+    host = (host or "").lower()
+    env_map = _parse_git_hosts_env()
+    spec = env_map.get(host) or _BUILTIN_GIT_HOSTS.get(host)
+    if not spec and host.endswith(".github.com"):
+        spec = env_map.get("github.com") or _BUILTIN_GIT_HOSTS.get("github.com")
+    if not spec:
+        return None
+    return TokenProvider.parse(spec)
+
+
+async def _fetch_token_for(provider: TokenProvider) -> str:
+    """Dispatch to the right token source for `provider`. "" if unavailable."""
+    if provider.kind == "oauth":
+        # Scopes are provider-specific. We hard-code rather than expose them in
+        # the env spec because the right value is a function of what the forge
+        # calls "private repo read" — not something the operator should have to
+        # know. Add new entries here as new oauth providers come online.
+        scopes = {"github": ["repo"]}.get(provider.name, [])
+        return await _fetch_oauth_token(provider.name, scopes)
+    if provider.kind == "secret":
+        return (await _fetch_secrets([provider.name])).get(provider.name, "").strip()
+    return ""
+
+
+def _inject_token(url: str, token: str) -> str:
     """Put a token into an http(s) URL's authority for a one-shot authenticated
     git operation. Matches openhost's `inject_github_token_in_url`. Non-http
     transports (ssh) are returned unchanged — the token can't be applied.
@@ -308,8 +393,9 @@ def _inject_github_token(url: str, token: str) -> str:
     The token is percent-encoded so values containing `:`/`@`/`/`/`%` don't
     corrupt the URL's authority section. GitHub tokens today are
     `[A-Za-z0-9_]` and pass through unchanged, but encoding here keeps us
-    safe against future token formats and against a malformed value supplied
-    by a misconfigured oauth provider."""
+    safe against future token formats, against Forgejo PATs (which can include
+    arbitrary user-supplied characters depending on how they were generated),
+    and against a malformed value supplied by a misconfigured provider."""
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme in ("http", "https") and parsed.hostname:
         host = parsed.hostname + (f":{parsed.port}" if parsed.port else "")
@@ -322,7 +408,7 @@ async def _run_ls_remote(repo: str, ref: str | None, token: str) -> tuple[int, s
     """Run `git ls-remote <repo> [ref]` with prompts disabled. Returns
     (returncode, stdout, stderr); returncode 124 signals a timeout. Inputs are
     validated before this is called and passed as argv, so there's no shell."""
-    url = _inject_github_token(repo, token) if token else repo
+    url = _inject_token(repo, token) if token else repo
     args = ["git", "ls-remote", url]
     if ref:
         args.append(ref)
@@ -339,7 +425,7 @@ async def _run_ls_remote(repo: str, ref: str | None, token: str) -> tuple[int, s
 
 
 async def _resolve_access(repo: str, ref: str) -> RepoAccess:
-    """Probe `repo`/`ref`, minting a GitHub token if the repo is private."""
+    """Probe `repo`/`ref`, minting/looking up a token if the host is configured."""
     # A named ref (branch/tag) can be confirmed via ls-remote; a bare sha can't,
     # so for shas we only probe repo reachability and let the checkout degrade.
     ref_probe = None if _SHA_RE.match(ref) else ref
@@ -352,10 +438,13 @@ async def _resolve_access(repo: str, ref: str) -> RepoAccess:
     if rc == 124 or _NETWORK_ERR_RE.search(err):
         return RepoAccess("error", detail=err.strip())
 
-    # Unauthenticated read failed. For GitHub, retry with a minted token.
-    if _is_github(repo):
-        token = await _fetch_github_token()
-        if token and _inject_github_token(repo, token) != repo:
+    # Unauthenticated read failed. If the host has a configured token provider
+    # (GitHub built-in, or a Forgejo declared via WORKSPACE_GIT_HOSTS), retry
+    # with a token from it.
+    provider = _token_provider_for_host(_git_host(repo))
+    if provider is not None:
+        token = await _fetch_token_for(provider)
+        if token and _inject_token(repo, token) != repo:
             rc2, out2, err2 = await _run_ls_remote(repo, ref_probe, token=token)
             if rc2 == 0:
                 if ref_probe is not None and not out2.strip():
@@ -365,11 +454,12 @@ async def _resolve_access(repo: str, ref: str) -> RepoAccess:
                 return RepoAccess("error", detail=err2.strip())
             # Even with our token we can't see it: treat as not found.
             return RepoAccess("not_found", detail=err2.strip())
-        # No usable token (no grant / no connected account / ssh transport):
-        # the repo is private and we have no authorization for it.
+        # No usable token (no grant / no connected account / no PAT in secrets /
+        # ssh transport): the host *should* support auth but we have none, so
+        # the repo is effectively private-to-us.
         return RepoAccess("forbidden", detail=err.strip())
 
-    # Non-GitHub host — classify from git's own error text.
+    # Host has no configured token provider — classify from git's own error text.
     if _AUTH_ERR_RE.search(err):
         return RepoAccess("forbidden", detail=err.strip())
     return RepoAccess("not_found", detail=err.strip())
@@ -482,7 +572,7 @@ async def open_workspace() -> object:
         "WORKSPACE_REF": ref,
     }
     if access.token:
-        env["WORKSPACE_GITHUB_TOKEN"] = access.token
+        env["WORKSPACE_GIT_TOKEN"] = access.token
     _put_pending(
         sid,
         PendingSession(

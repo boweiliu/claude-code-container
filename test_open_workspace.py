@@ -43,30 +43,81 @@ def test_git_host(url, host):
     assert server._git_host(url) == host
 
 
-@pytest.mark.parametrize(
-    "url, github",
-    [
-        ("https://github.com/o/r.git", True),
-        ("git@github.com:o/r.git", True),
-        ("https://gitlab.com/o/r.git", False),
-        ("ssh://git@example.com/o/r.git", False),
-    ],
-)
-def test_is_github(url, github):
-    assert server._is_github(url) is github
-
-
-def test_inject_github_token_https():
+def test_inject_token_https():
     assert (
-        server._inject_github_token("https://github.com/o/r.git", "ghs_abc")
+        server._inject_token("https://github.com/o/r.git", "ghs_abc")
         == "https://ghs_abc@github.com/o/r.git"
     )
 
 
-def test_inject_github_token_leaves_ssh_unchanged():
+def test_inject_token_leaves_ssh_unchanged():
     # The token can't be applied to an ssh transport.
-    assert server._inject_github_token("git@github.com:o/r.git", "ghs_abc") == "git@github.com:o/r.git"
-    assert server._inject_github_token("ssh://git@github.com/o/r.git", "t") == "ssh://git@github.com/o/r.git"
+    assert server._inject_token("git@github.com:o/r.git", "ghs_abc") == "git@github.com:o/r.git"
+    assert server._inject_token("ssh://git@github.com/o/r.git", "t") == "ssh://git@github.com/o/r.git"
+
+
+# ── host → token-provider lookup ──────────────────────────────────────────
+
+
+def test_github_is_builtin_oauth_provider(monkeypatch):
+    # No env config — github.com still resolves to the built-in oauth provider.
+    monkeypatch.delenv("WORKSPACE_GIT_HOSTS", raising=False)
+    p = server._token_provider_for_host("github.com")
+    assert p == server.TokenProvider(kind="oauth", name="github")
+    # *.github.com inherits the same.
+    assert server._token_provider_for_host("gist.github.com") == p
+
+
+def test_unknown_host_has_no_provider(monkeypatch):
+    monkeypatch.delenv("WORKSPACE_GIT_HOSTS", raising=False)
+    assert server._token_provider_for_host("gitlab.com") is None
+    assert server._token_provider_for_host("") is None
+
+
+def test_env_declares_forgejo_pat_host(monkeypatch):
+    monkeypatch.setenv("WORKSPACE_GIT_HOSTS", "git.example.com=secret:FORGEJO_TOKEN_EXAMPLE")
+    p = server._token_provider_for_host("git.example.com")
+    assert p == server.TokenProvider(kind="secret", name="FORGEJO_TOKEN_EXAMPLE")
+    # Case-insensitive on host.
+    assert server._token_provider_for_host("Git.Example.COM") == p
+
+
+def test_env_can_override_github_builtin(monkeypatch):
+    # Useful when oauth-v2 isn't installed in a particular deployment.
+    monkeypatch.setenv("WORKSPACE_GIT_HOSTS", "github.com=secret:GH_PAT")
+    p = server._token_provider_for_host("github.com")
+    assert p == server.TokenProvider(kind="secret", name="GH_PAT")
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "",
+        "   ",
+        "no-equals-sign",
+        "=spec-with-no-host",
+        "host=",
+        "host=bogus-no-colon",
+        "host=unknown-kind:foo",
+        "host=oauth:",
+    ],
+)
+def test_malformed_env_entries_are_ignored(monkeypatch, raw):
+    # A typo in env must not break unrelated hosts (notably github.com).
+    monkeypatch.setenv("WORKSPACE_GIT_HOSTS", raw)
+    # github built-in still works.
+    assert server._token_provider_for_host("github.com") == server.TokenProvider("oauth", "github")
+    # The malformed entry doesn't accidentally produce a provider.
+    assert server._token_provider_for_host("host") is None
+
+
+def test_env_multiple_hosts(monkeypatch):
+    monkeypatch.setenv(
+        "WORKSPACE_GIT_HOSTS",
+        "git.a.com=secret:A_TOK , git.b.com=secret:B_TOK",
+    )
+    assert server._token_provider_for_host("git.a.com").name == "A_TOK"
+    assert server._token_provider_for_host("git.b.com").name == "B_TOK"
 
 
 # ── _resolve_access classification ───────────────────────────────────────────
@@ -85,9 +136,18 @@ def _stub_ls_remote(monkeypatch, results):
     return calls
 
 
+def _stub_token(monkeypatch, token: str) -> None:
+    """Make `_fetch_token_for` return a fixed token regardless of provider."""
+
+    async def fake(provider):
+        return token
+
+    monkeypatch.setattr(server, "_fetch_token_for", fake)
+
+
 def test_resolve_public_repo_ok(monkeypatch):
     _stub_ls_remote(monkeypatch, [(0, "abc\trefs/heads/main\n", "")])
-    monkeypatch.setattr(server, "_fetch_github_token", _none_token)
+    _stub_token(monkeypatch, "")
     access = run(server._resolve_access("https://github.com/o/r.git", "main"))
     assert access.decision == "ok"
     assert access.token == ""
@@ -112,11 +172,7 @@ def test_resolve_sha_ref_skips_ref_probe(monkeypatch):
 def test_resolve_private_github_with_token(monkeypatch):
     # Unauthenticated probe fails, authenticated probe succeeds.
     _stub_ls_remote(monkeypatch, [(128, "", "fatal: repository not found"), (0, "abc\tHEAD\n", "")])
-
-    async def token():
-        return "ghs_tok"
-
-    monkeypatch.setattr(server, "_fetch_github_token", token)
+    _stub_token(monkeypatch, "ghs_tok")
     access = run(server._resolve_access("https://github.com/o/private.git", "main"))
     assert access.decision == "ok"
     assert access.token == "ghs_tok"
@@ -124,31 +180,90 @@ def test_resolve_private_github_with_token(monkeypatch):
 
 def test_resolve_github_not_found_even_with_token(monkeypatch):
     _stub_ls_remote(monkeypatch, [(128, "", "not found"), (128, "", "not found")])
-
-    async def token():
-        return "ghs_tok"
-
-    monkeypatch.setattr(server, "_fetch_github_token", token)
+    _stub_token(monkeypatch, "ghs_tok")
     access = run(server._resolve_access("https://github.com/o/ghost.git", "main"))
     assert access.decision == "not_found"
 
 
 def test_resolve_private_github_no_token_is_forbidden(monkeypatch):
     _stub_ls_remote(monkeypatch, [(128, "", "fatal: repository not found")])
-    monkeypatch.setattr(server, "_fetch_github_token", _none_token)
+    _stub_token(monkeypatch, "")
     access = run(server._resolve_access("https://github.com/o/private.git", "main"))
     assert access.decision == "forbidden"
 
 
 def test_resolve_non_github_auth_error_is_forbidden(monkeypatch):
+    # Unconfigured host falls back to git's own error text — a clear auth
+    # error there means "forbidden".
+    monkeypatch.delenv("WORKSPACE_GIT_HOSTS", raising=False)
     _stub_ls_remote(monkeypatch, [(128, "", "fatal: Authentication failed for 'https://gitlab.com/o/r.git'")])
     access = run(server._resolve_access("https://gitlab.com/o/r.git", "main"))
     assert access.decision == "forbidden"
 
 
 def test_resolve_non_github_not_found(monkeypatch):
+    monkeypatch.delenv("WORKSPACE_GIT_HOSTS", raising=False)
     _stub_ls_remote(monkeypatch, [(128, "", "fatal: repository 'https://gitlab.com/o/ghost.git/' not found")])
     access = run(server._resolve_access("https://gitlab.com/o/ghost.git", "main"))
+    assert access.decision == "not_found"
+
+
+# ── Forgejo (PAT-via-secrets) ────────────────────────────────────────────────
+
+
+def test_resolve_forgejo_public_repo_ok(monkeypatch):
+    # Even if a host is declared, a successful unauthenticated probe should
+    # take the fast path without consulting secrets.
+    monkeypatch.setenv("WORKSPACE_GIT_HOSTS", "forge.example=secret:FORGE_TOK")
+    _stub_ls_remote(monkeypatch, [(0, "abc\trefs/heads/main\n", "")])
+    access = run(server._resolve_access("https://forge.example/o/r.git", "main"))
+    assert access.decision == "ok"
+    assert access.token == ""
+
+
+def test_resolve_forgejo_private_with_pat(monkeypatch):
+    monkeypatch.setenv("WORKSPACE_GIT_HOSTS", "forge.example=secret:FORGE_TOK")
+    _stub_ls_remote(monkeypatch, [(128, "", "fatal: repository not found"), (0, "abc\tHEAD\n", "")])
+
+    async def fake_secrets(keys):
+        assert keys == ["FORGE_TOK"]
+        return {"FORGE_TOK": "forgejo_pat_xyz"}
+
+    monkeypatch.setattr(server, "_fetch_secrets", fake_secrets)
+    access = run(server._resolve_access("https://forge.example/o/private.git", "main"))
+    assert access.decision == "ok"
+    assert access.token == "forgejo_pat_xyz"
+
+
+def test_resolve_forgejo_private_without_pat_is_forbidden(monkeypatch):
+    # Host is configured to require a PAT, but secrets-v2 doesn't have one —
+    # treat it as private to us, same as the GitHub-no-grant case.
+    monkeypatch.setenv("WORKSPACE_GIT_HOSTS", "forge.example=secret:FORGE_TOK")
+    _stub_ls_remote(monkeypatch, [(128, "", "fatal: repository not found")])
+
+    async def fake_secrets(keys):
+        return {}
+
+    monkeypatch.setattr(server, "_fetch_secrets", fake_secrets)
+    access = run(server._resolve_access("https://forge.example/o/private.git", "main"))
+    assert access.decision == "forbidden"
+
+
+def test_resolve_forgejo_pat_doesnt_grant_access(monkeypatch):
+    # PAT exists but doesn't actually see the repo — mirror the GitHub case:
+    # "not_found" rather than "forbidden", so a typo'd repo URL doesn't read
+    # as a permissions problem.
+    monkeypatch.setenv("WORKSPACE_GIT_HOSTS", "forge.example=secret:FORGE_TOK")
+    _stub_ls_remote(
+        monkeypatch,
+        [(128, "", "fatal: repository not found"), (128, "", "fatal: repository not found")],
+    )
+
+    async def fake_secrets(keys):
+        return {"FORGE_TOK": "some_pat"}
+
+    monkeypatch.setattr(server, "_fetch_secrets", fake_secrets)
+    access = run(server._resolve_access("https://forge.example/o/ghost.git", "main"))
     assert access.decision == "not_found"
 
 
@@ -162,10 +277,6 @@ def test_resolve_timeout_is_error(monkeypatch):
     _stub_ls_remote(monkeypatch, [(124, "", "timed out")])
     access = run(server._resolve_access("https://github.com/o/r.git", "main"))
     assert access.decision == "error"
-
-
-async def _none_token():
-    return ""
 
 
 # ── route behavior ───────────────────────────────────────────────────────────
@@ -259,6 +370,9 @@ def test_success_redirects_303_with_location(monkeypatch):
     assert pending.env["WORKSPACE_REPO"] == "https://github.com/o/r.git"
     assert pending.env["WORKSPACE_REF"] == "main"
     assert pending.env["WORKSPACE_DIR"] == "r"
+    assert "WORKSPACE_GIT_TOKEN" not in pending.env
+    # Legacy GitHub-only name must be gone — if anything still keys off it,
+    # the rename hasn't happened on that side.
     assert "WORKSPACE_GITHUB_TOKEN" not in pending.env
 
 
@@ -267,7 +381,8 @@ def test_success_passes_token_to_pending(monkeypatch):
     _stub_access(monkeypatch, "ok", token="ghs_secret")
     resp = _post(form={"repo": "https://github.com/o/private.git", "ref": "abc1234"})
     assert resp.status_code == 303
-    assert _only_pending().env["WORKSPACE_GITHUB_TOKEN"] == "ghs_secret"
+    assert _only_pending().env["WORKSPACE_GIT_TOKEN"] == "ghs_secret"
+    assert "WORKSPACE_GITHUB_TOKEN" not in _only_pending().env
 
 
 # ── token URL injection: malformed/invalid token shapes ──────────────────────
@@ -303,17 +418,17 @@ def test_success_passes_token_to_pending(monkeypatch):
         ("a\nb", "https://a%0Ab@github.com/o/r.git"),
     ],
 )
-def test_inject_github_token_encodes_unsafe_chars(token, expected):
-    assert server._inject_github_token("https://github.com/o/r.git", token) == expected
+def test_inject_token_encodes_unsafe_chars(token, expected):
+    assert server._inject_token("https://github.com/o/r.git", token) == expected
 
 
 @pytest.mark.parametrize(
     "token",
     ["evil@attacker.com", "foo:bar", "a/b", "pct%20", "a b", "a\nb"],
 )
-def test_inject_github_token_preserves_host_under_unsafe_input(token):
+def test_inject_token_preserves_host_under_unsafe_input(token):
     """No token shape may shift the URL's host away from github.com."""
-    out = server._inject_github_token("https://github.com/o/r.git", token)
+    out = server._inject_token("https://github.com/o/r.git", token)
     parsed = urllib.parse.urlparse(out)
     assert parsed.hostname == "github.com"
     assert parsed.path == "/o/r.git"
@@ -332,16 +447,16 @@ def test_inject_github_token_preserves_host_under_unsafe_input(token):
         ("foo:bar", "https://foo%3Abar@github.com:8443/o/r.git"),
     ],
 )
-def test_inject_github_token_preserves_port(token, expected):
+def test_inject_token_preserves_port(token, expected):
     """Explicit-port URLs must round-trip with the port intact, including under
     unsafe token shapes that target the port/host boundary."""
-    assert server._inject_github_token("https://github.com:8443/o/r.git", token) == expected
+    assert server._inject_token("https://github.com:8443/o/r.git", token) == expected
 
 
-def test_inject_github_token_empty_token_still_safe():
-    # An empty token shouldn't reach `_inject_github_token` (the caller checks
+def test_inject_token_empty_token_still_safe():
+    # An empty token shouldn't reach `_inject_token` (the caller checks
     # first), but if it ever did, the URL must remain syntactically valid.
-    out = server._inject_github_token("https://github.com/o/r.git", "")
+    out = server._inject_token("https://github.com/o/r.git", "")
     parsed = urllib.parse.urlparse(out)
     assert parsed.hostname == "github.com"
 

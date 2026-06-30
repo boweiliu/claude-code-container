@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 # Runs in an /open-workspace terminal. All inputs arrive via env vars
 # (WORKSPACE_REPO, WORKSPACE_DIR, WORKSPACE_REF, and optionally
-# WORKSPACE_GITHUB_TOKEN) set by server.py — never string interpolation — so
+# WORKSPACE_GIT_TOKEN) set by server.py — never string interpolation — so
 # there's nothing to escape and no shell injection surface.
 #
 # We deliberately don't `set -e`: if a step fails we report it and still drop
 # the user into a shell so they can poke around (the provider may degrade
 # gracefully — see REQ-IMPL-7 in the open-workspace contract).
 #
-# If WORKSPACE_GITHUB_TOKEN is set, the repo is private and openhost minted us a
-# transient token. We inject it into the clone/fetch URL but always leave the
-# persisted `origin` URL token-free, matching how openhost clones private repos
+# If WORKSPACE_GIT_TOKEN is set, the repo is private and the server obtained a
+# transient token for us (a minted GitHub token, a configured Forgejo PAT, etc).
+# We inject it into the clone/fetch URL but always leave the persisted `origin`
+# URL token-free, matching how openhost clones private repos
 # (compute_space/core/apps.py): the token never lands on disk.
 #
 # If the target dir already holds a checkout (e.g. the link was clicked before),
@@ -27,10 +28,10 @@ CLEAN_URL="$WORKSPACE_REPO"
 # token containing `:`/`@`/`/`/`%` can't corrupt the URL — server.py applies
 # the same encoding for the probe path; the two must stay in sync.
 AUTHED_URL="$CLEAN_URL"
-if [ -n "${WORKSPACE_GITHUB_TOKEN:-}" ]; then
+if [ -n "${WORKSPACE_GIT_TOKEN:-}" ]; then
     ENCODED_TOKEN="$(
         python3 -c 'import sys, urllib.parse; sys.stdout.write(urllib.parse.quote(sys.argv[1], safe=""))' \
-            "$WORKSPACE_GITHUB_TOKEN"
+            "$WORKSPACE_GIT_TOKEN"
     )"
     case "$CLEAN_URL" in
         https://*) AUTHED_URL="https://${ENCODED_TOKEN}@${CLEAN_URL#https://}" ;;
@@ -41,7 +42,7 @@ fi
 # AUTHED_URL is a plain (non-exported) shell var; once we've captured it the
 # token env var is no longer needed, so drop it before any `exec bash` so it
 # can't leak into the interactive shell the user lands in.
-unset WORKSPACE_GITHUB_TOKEN
+unset WORKSPACE_GIT_TOKEN
 
 echo
 if [ -d "$WORKSPACE_DIR/.git" ]; then
